@@ -1,0 +1,13 @@
+[project]
+name = "my-claude-code"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+link-mode = "copy"
+requires-python = ">=3.14"
+dependencies = [
+    "click>=8.3.3",
+    "langchain>=1.3.0",
+    "langchain-openai>=1.2.1",
+    "langgraph>=1.2.0",
+]
