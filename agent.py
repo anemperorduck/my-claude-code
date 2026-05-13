@@ -1,53 +1,66 @@
-from typing import List, Callable, Tuple
+from typing import List, Callable, Tuple, Dict, Any
 from openai import OpenAI
 from dotenv import load_dotenv
 import os
 import inspect
 import re
 import ast
+import platform
 from string import Template
-from prompt_template import react_system_prompt_template
+from prompt_template import planner_system_prompt_template, executor_system_prompt_template
 
 
-class ReActAgent:
-    def __init__(self, tools: List[Callable], model: str, project_directory: str):
+class PlanAndExecuteAgent:
+    def __init__(self, tools: List[Callable], model: str, project_directory: str, max_iterations: int = 20):
         self.tools = { func.__name__: func for func in tools}
         self.model = model
         self.project_directory = project_directory
+        self.max_iterations = max_iterations
         self.client = OpenAI(
             base_url="https://api.deepseek.com",
-            api_key=ReActAgent.get_api_key(),
+            api_key=PlanAndExecuteAgent.get_api_key(),
         )
 
     def run(self, user_input: str):
+        plan = self.create_plan(user_input)
+        print(f"\n Plan：\n{plan}")
+
         messages = [
-            {"role": "system", "content": self.render_system_prompt(react_system_prompt_template)},
+            {"role": "system", "content": self.render_system_prompt(executor_system_prompt_template, plan=plan)},
             {"role": "user", "content": user_input}
         ]
 
-        while True:
+        for _ in range(self.max_iterations):
             # 请求模型
             content = self.call_model(messages)
 
+            # 检测 Current Step
+            current_step = self.extract_tag(content, "current_step")
+            if current_step:
+                print(f"\n Current Step: {current_step}")
+
             # 检测 Thought
-            thought_match = re.search(r"<thought>(.*?)</thought>", content, re.DOTALL)
-            if thought_match:
-                thought = thought_match.group(1)
-            print(f"\n Though: {thought}")
+            thought = self.extract_tag(content, "thought")
+            if thought:
+                print(f"\n Thought: {thought}")
             
             # 检测是否输出 Final Answer，如果是，直接返回
-            if "<final_answer>" in content:
-                final_answer = re.search(r"<final_answer>(.*?)</final_answer>", content, re.DOTALL)
-                return final_answer.group(1)
+            final_answer = self.extract_tag(content, "final_answer")
+            if final_answer:
+                return final_answer
             
             # 检测 Action
-            action_match = re.search(r"<action>(.*?)</action>", content, re.DOTALL)
-            if not action_match:
+            action = self.extract_tag(content, "action")
+            if not action:
                 raise RuntimeError("模型未输出 <action>")
-            action = action_match.group(1)
-            tool_name, args = self.parse_action(action)
+            tool_name, args, kwargs = self.parse_action(action)
+            if tool_name not in self.tools:
+                observation = f"工具不存在：{tool_name}。可用工具：{', '.join(self.tools.keys())}"
+                messages.append({"role": "user", "content": f"<observation>{observation}</observation>"})
+                continue
 
-            print(f"\n Action: {tool_name}({', '.join(args)})")
+            formatted_args = ", ".join([repr(arg) for arg in args] + [f"{key}={value!r}" for key, value in kwargs.items()])
+            print(f"\n Action: {tool_name}({formatted_args})")
             
             # 只有终端命令才需要询问用户，其他工具继续执行
             should_continue = input(f"请求调用Tool-{tool_name}\n是否继续？（Y/N）") \
@@ -57,16 +70,31 @@ class ReActAgent:
                 return "操作已被用户取消"
             
             try:
-                observation = self.tools[tool_name](*args)
+                observation = self.tools[tool_name](*args, **kwargs)
             except Exception as e:
                 observation = f"工具执行错误：{str(e)}"
             
             print(f"\n Observation：{observation}")
             obs_msg = f"<observation>{observation}</observation>"
             messages.append({"role": "user", "content": obs_msg})
+
+        raise RuntimeError(f"执行超过最大轮数限制：{self.max_iterations}")
+
+
+    def create_plan(self, user_input: str) -> str:
+        """先规划，再进入工具执行循环。"""
+        messages = [
+            {"role": "system", "content": self.render_system_prompt(planner_system_prompt_template)},
+            {"role": "user", "content": user_input}
+        ]
+        content = self.call_model(messages)
+        plan = self.extract_tag(content, "plan")
+        if not plan:
+            raise RuntimeError("模型未输出 <plan>")
+        return plan.strip()
     
 
-    def render_system_prompt(self, system_prompt_template: str) -> str:
+    def render_system_prompt(self, system_prompt_template: str, **extra_values: str) -> str:
         """渲染系统提示模板，替换变量"""
         tool_list = self.get_tool_list()
         file_list = ", ".join(
@@ -74,11 +102,14 @@ class ReActAgent:
             for f in os.listdir(self.project_directory)
         )
 
-        return Template(system_prompt_template).substitute(
-            operating_system = self.get_operating_system_name(),
-            tool_list = tool_list,
-            file_list = file_list
-        )
+        values = {
+            "operating_system": self.get_operating_system_name(),
+            "tool_list": tool_list,
+            "file_list": file_list,
+            **extra_values,
+        }
+
+        return Template(system_prompt_template).substitute(values)
 
 
     def get_tool_list(self) -> str:
@@ -99,6 +130,7 @@ class ReActAgent:
             "Windows": "Windows",
             "Linux": "Linux"
         }
+        return os_map.get(platform.system(), platform.system())
 
 
     def call_model(self, message):
@@ -116,7 +148,29 @@ class ReActAgent:
 
         return content
 
-    def parse_action(self, code_str: str) -> Tuple[str, List[str]]:
+    def extract_tag(self, content: str, tag_name: str) -> str | None:
+        match = re.search(rf"<{tag_name}>(.*?)</{tag_name}>", content, re.DOTALL)
+        return match.group(1).strip() if match else None
+
+    def parse_action(self, code_str: str) -> Tuple[str, List[Any], Dict[str, Any]]:
+        code_str = code_str.strip()
+
+        try:
+            expression = ast.parse(code_str, mode="eval").body
+            if not isinstance(expression, ast.Call) or not isinstance(expression.func, ast.Name):
+                raise ValueError("Invalid function call syntax")
+
+            args = [ast.literal_eval(arg) for arg in expression.args]
+            kwargs = {
+                keyword.arg: ast.literal_eval(keyword.value)
+                for keyword in expression.keywords
+                if keyword.arg is not None
+            }
+            return expression.func.id, args, kwargs
+        except Exception:
+            return self._parse_action_fallback(code_str)
+
+    def _parse_action_fallback(self, code_str: str) -> Tuple[str, List[Any], Dict[str, Any]]:
         match = re.match(r'(\w+)\((.*)\)', code_str, re.DOTALL)
         if not match:
             raise ValueError("Invalid function call syntax")
@@ -164,7 +218,7 @@ class ReActAgent:
         if current_arg.strip():
             args.append(self._parse_single_arg(current_arg.strip()))
 
-        return func_name, args
+        return func_name, args, {}
 
     def _parse_single_arg(self, arg_str: str):
         """解析单个参数"""
@@ -197,4 +251,8 @@ class ReActAgent:
         if not api_key:
             raise ValueError("未找到 OPENROUTER_API_KEY 环境变量，请在 .env 文件中设置。")
         return api_key
+
+
+# Backward-compatible alias for older code paths.
+ReActAgent = PlanAndExecuteAgent
     
